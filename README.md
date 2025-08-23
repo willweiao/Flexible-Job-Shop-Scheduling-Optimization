@@ -1,7 +1,8 @@
 # Flexible-Job-Shop-Scheduling-Optimization
 
-使用数据集：Brandimarte FJSP Dataset (Credit to the repository: [SchedulingLab/fjsp-instances][https://github.com/SchedulingLab/fjsp-instances])
-模型参考：[柔性车间作业调度（Flexible Job-shop Scheduling Problem, FJSP）][https://blog.csdn.net/weixin_46225503/article/details/132246053]
+使用数据集：Brandimarte FJSP Dataset (Credit to the repository: [SchedulingLab/fjsp-instances](https://github.com/SchedulingLab/fjsp-instances))
+
+模型参考：[柔性车间作业调度（Flexible Job-shop Scheduling Problem, FJSP）](https://blog.csdn.net/weixin_46225503/article/details/132246053)
 
 完成进度：
 08/24 完成简化模型的建模以及对case mk01的求解、可视化
