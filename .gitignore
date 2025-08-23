@@ -205,3 +205,56 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# dataset
+raw/
+processed/
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.ipynb_checkpoints/
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === Envs / IDE ===
+.venv/
+venv/
+env/
+.conda/
+.idea/
+.vscode/
+
+# === Logs ===
+logs/
+*.log
+
+# === Data (raw & processed) ===
+data/raw/
+data/processed/
+
+# === Solver outputs & reproducible artifacts ===
+outputs/**/solution.sol
+outputs/**/model.mps
+outputs/**/run_meta.json
+outputs/**/viz_manifest.json
+outputs/**/schedule_gantt.csv
+outputs/**/assignment_*.csv
+
+# === Default: ignore all figures
+outputs/**/figs/
+
+# --- Exception: keep mk01 figures as demo (for README) ---
+!outputs/mk01/
+outputs/mk01/*
+!outputs/mk01/figs/
+outputs/mk01/figs/*
+!outputs/mk01/figs/gantt_mk01.png
+!outputs/mk01/figs/util_mk01.png
+!outputs/mk01/figs/job_completion_mk01.png
+!outputs/mk01/figs/wip_mk01.png
