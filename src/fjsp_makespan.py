@@ -1,6 +1,10 @@
 """
-本项目是
+本项目是fjsp_makespan.py —— 灵活作业车间调度（FJSP）建模与求解
+使用 Pyomo 构建 FJSP 的 MILP 数学模型，以最小化最大完工时间（Cmax）为目标。
+模型包括机器分配变量、相邻序列变量以及 MTZ 防子环约束，并支持调用 Gurobi 求解器。
+运行后可导出调度结果，用于后续可视化分析（如甘特图、机器利用率等）。
 """
+
 # import dependencies
 import json
 import time
