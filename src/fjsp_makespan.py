@@ -10,8 +10,10 @@ import json
 import time
 from pathlib import Path
 from collections import defaultdict
-
+import math
 import pandas as pd
+from math import ceil
+from pyomo.opt import TerminationCondition
 from pyomo.environ import (
     ConcreteModel, Set, Param, Var, NonNegativeReals, Binary,
     Objective, Constraint, minimize, SolverFactory, value
@@ -181,7 +183,7 @@ def build_model_adj(ops, eligible, proc_time, pred, machines, ES, H,
     model.OutKeys  = Set(dimen=2, initialize=out_keys)   # (i,a)
 
     # Big-M 参数（只对 op->op 弧）
-    model.Mbig = Param(model.ArcsOpOp, initialize=Mbig, within=NonNegativeReals, mutable=False)
+    model.Mbig = Param(model.ArcsOpOp, initialize=Mbig, within=NonNegativeReals, mutable=True)
 
     # === 变量 ===
     # 机器指派
@@ -364,6 +366,94 @@ def warm_start_adj(model, ops, eligible, proc_time):
             if (m,op) in model.u: model.u[(m,op)].value = float(rank)
 
 
+# =====贪心调度生成快速可行解作为UB和MIPstart, 防止找不到incumbent报错跳出=====
+def _build_successor_map(ops):
+    # 每个 job 是线性工艺：为每个 op 建 succ（无则 None）
+    by_job = {}
+    for iop, j, k in ops:
+        by_job.setdefault(j, []).append((k, iop))
+    succ = {iop: None for (iop,_,_) in ops}
+    for j, lst in by_job.items():
+        lst.sort()
+        for t in range(len(lst)-1):
+            k, a = lst[t]
+            _, b = lst[t+1]
+            succ[a] = b
+    return succ
+
+def greedy_feasible_schedule(ops, eligible, proc_time, pred, machines):
+    """
+    简单双机贪心：就绪集合里选“最早可完成”的操作，
+    对每个操作在其可加工机器里挑  earliest_finish 最小的机器。
+    返回：UB, x0(op->m), S0(op->t), C0(op->t)
+    """
+    succ = _build_successor_map(ops)
+    avail = {m: 0.0 for m in machines}  # 每台机的可用时间
+    S0, C0, x0 = {}, {}, {}
+
+    # 就绪集合：前序为 None 的操作
+    ready = {iop for (iop,_,_) in ops if pred[iop] is None}
+    done = set()
+
+    # 为了快速查 job / op 序号
+    job_of = {iop: j for (iop,j,_) in ops}
+
+    while ready:
+        # 为每个就绪操作计算在其可行机上的最早完成
+        best = None  # (finish, start, op, mach)
+        for op in list(ready):
+            pj = pred[op]
+            rel = 0.0 if pj is None else C0[pj]  # 就绪时间（前序完工）
+            for m in eligible[op]:
+                start = max(rel, avail[m])
+                fin = start + proc_time[(op, m)]
+                cand = (fin, start, op, m)
+                if (best is None) or cand < best:
+                    best = cand
+        fin, start, op, m = best
+        # 安排该操作
+        S0[op] = start
+        C0[op] = fin
+        x0[op] = m
+        avail[m] = fin
+        ready.remove(op)
+        done.add(op)
+        # 释放其后继（若有）
+        nxt = succ[op]
+        if nxt is not None and pred[nxt] in done:
+            ready.add(nxt)
+
+        # 其它 job 中，若它们的前序也已经完成，随时进入就绪
+        for (iop,_,_) in ops:
+            if iop not in done and iop not in ready and (pred[iop] is None or pred[iop] in done):
+                ready.add(iop)
+
+    UB = max(C0.values()) if C0 else 0.0
+    return UB, x0, S0, C0
+
+def apply_warm_start(model, x0, S0, C0, UB=None):
+    """把贪心可行解灌进 Pyomo 变量（MIPStart）；可选同时设置 Cmax 的初值/上界。"""
+    # x
+    for key in model.x:
+        op, m = key
+        v = 1.0 if (op in x0 and x0[op] == m) else 0.0
+        model.x[key].value = v
+        model.x[key].stale = False
+    # S, C
+    for op in model.I:
+        if op in S0:
+            model.S[op].value = float(S0[op]); model.S[op].stale = False
+        if op in C0:
+            model.C[op].value = float(C0[op]); model.C[op].stale = False
+    # Cmax
+    if UB is not None:
+        try:
+            model.Cmax.value = float(UB)
+            model.Cmax.stale = False
+        except Exception:
+            pass
+
+
 # =====取解与快速可行性检查 =====
 def extract_schedule(model, ops, eligible):
     # 提取每个操作的分配机台与时间
@@ -385,6 +475,31 @@ def extract_schedule(model, ops, eligible):
             assert s2 + 1e-6 >= c1, f"Overlap on machine {m}: {i1}->{i2}"
 
     return schedule
+
+# —— 小工具：是否有 incumbent（可行解） ——
+def has_incumbent(result, model):
+    tc = getattr(result.solver, "termination_condition", None)
+    if tc in {TerminationCondition.infeasible,
+              TerminationCondition.unbounded,
+              TerminationCondition.infeasibleOrUnbounded}:
+        return False
+    return value(model.Cmax) is not None
+
+# —— 小工具：弧/度一致性自检，避免“结构剪没了” ——
+def sanity_check(Vi, arcs_all, incoming, outgoing):
+    ok = True
+    # 每台机要有 SRC→* 和 *→SNK
+    for i, ops_i in Vi.items():
+        if not any(ii == i and a == 'SRC' for (ii, a, b) in arcs_all):
+            print(f"[WARN] machine {i} has no SRC→* arcs"); ok = False
+        if not any(ii == i and b == 'SNK' for (ii, a, b) in arcs_all):
+            print(f"[WARN] machine {i} has no *→SNK arcs"); ok = False
+        for op in ops_i:
+            if not incoming.get((i, op)):
+                print(f"[WARN] empty incoming for (i={i}, op={op})"); ok = False
+            if not outgoing.get((i, op)):
+                print(f"[WARN] empty outgoing for (i={i}, op={op})"); ok = False
+    return ok
 
 
 # ===== 8) 保存结果进行数据分析 =====
@@ -438,29 +553,48 @@ def export_assignment_wide(model, ops, eligible, out_dir="outputs/mk01"):
                      "start": float(value(model.S[i])), "finish": float(value(model.C[i]))})
     pd.DataFrame(rows).to_csv(out/"assignment_wide.csv", index=False)
 
-def export_metadata(model, result, out_dir="outputs/mk01", extra=None):
+def export_metadata(model, result, out_dir="outputs/mk01", solver_name="gurobi", solver_options=None, extra=None):
+    """
+    把最关键的最优性信息也写进去：best_bound / gap / status / termination
+    solver_options 可把你实际传给求解器的 options 字典一并记录
+    """
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+    Cmax = float(value(model.Cmax)) if value(model.Cmax) is not None else None
+
+    # Pyomo 的 result.solver 里通常可以取到 best_bound / termination 等
+    best_bd = getattr(result.solver, "best_bound", None)
+    status = str(getattr(result.solver, "status", ""))           # SolverStatus
+    termination = str(getattr(result.solver, "termination_condition", ""))  # TerminationCondition
+    runtime = getattr(result.solver, "time", None)  # 有时是 wallclock_time / user_time，依接口而定
+
+    gap = None
+    if (Cmax is not None) and (best_bd is not None):
+        try:
+            gap = float((Cmax - float(best_bd)) / max(1.0, abs(Cmax)))
+        except Exception:
+            gap = None
+
     meta = {
-        "Cmax": float(value(model.Cmax)),
-        "termination": str(result.solver.termination_condition),
-        "time": getattr(result.solver, "time", None),
+        "Cmax": Cmax,
+        "best_bound": float(best_bd) if best_bd is not None else None,
+        "gap": gap,
+        "status": status,
+        "termination": termination,
+        "time": runtime,
         "wall_clock": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "solver": "gurobi",
-        "params": {
-            # 若你设置了参数，也可以一起存下来
-            "TimeLimit": 300, "MIPGap": 0.02, "Threads":16,
-            "MIPfocus": 1, "Heuristic": 0.2, "Presolve": 2,
-            "Cuts": 2
-        }
+        "solver": solver_name,
+        "params": solver_options or {},  # <<- 记录你真实传给求解器的 options
     }
-    if extra: meta.update(extra)
+    if extra:
+        meta.update(extra)
+
     (out/"run_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print("Saved:", (out/"run_meta.json").resolve())
 
 
 # ===== 9) 主程序：把以上步骤串起来 =====
 def main():
-    case_name = "mk05"  # 根据所运行的案例进行修改
+    case_name = "mk06"  # 根据所运行的案例进行修改
     OUT_DIR = Path(f"outputs/{case_name}")
     LOGS_DIR = Path("logs")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -469,71 +603,179 @@ def main():
     # 1) 读取数据
     routing_csv = Path(f"data/processed/brandimarte/{case_name}/routing.csv")
     assert routing_csv.exists(), f"routing.csv not found: {routing_csv}"
-
-    # 2）建模
     ops, eligible, proc_time, pred, machines, jk2i = load_routing(routing_csv)
+
+    # 2) 基础界：ES / 下界 / 安全上界
     pmin, ES, H = bounds_for_bigM(ops, eligible, proc_time)
-    I_ops = [i for (i,_,_) in ops]
-    Vi, arcs_all, arcs_opop, in_keys, incoming, out_keys, outgoing, Mbig, Ui = \
-        build_adj_structures(I=I_ops, M=machines, eligible=eligible, ES=ES, H=H)
     
+    # 下界：作业最短链 + assignment 下界
     # 为了更有效地推下界，考虑基于 routing.csv 的数据计算每个作业的最短加工时间之和并取最大，作为全局 Cmax 的下界
     # ops: list of (op_id, job, ord), eligible: {op_id: [machines]}, proc_time: {(op_id, m): p}
     # 按作业分组
     job_ops = {}
     for iop, j, k in ops:
         job_ops.setdefault(j, []).append(iop)
-
-    # 每个操作的“最短可加工时间”（在可行机里取 min）
-    op_min_p = {}
-    for j, oplist in job_ops.items():
-        for op in oplist:
-            op_min_p[op] = min(proc_time[(op, m)] for m in eligible[op])
-
-    # 每个作业的最短总工时 & 全局下界
-    LB_job = {j: sum(op_min_p[op] for op in oplist) for j, oplist in job_ops.items()}
-    Cmax_lb_jobs = max(LB_job.values())
-
-    # 计算机器容量分配的赋值松弛下界（preemptive的情形）
+    op_min_p = {op: min(proc_time[(op, m)] for m in eligible[op]) for oplist in job_ops.values() for op in oplist}
+    LB_job = max(sum(op_min_p[op] for op in oplist) for oplist in job_ops.values())
     LB_assign = compute_assignment_LB(ops, eligible, proc_time, machines)
+    Cmax_lb_init = max(LB_job, int(ceil(LB_assign)))
 
-    model = build_model_adj(ops, eligible, proc_time, pred, machines, ES, H,
-                        Vi, arcs_all, arcs_opop, in_keys, incoming, out_keys, outgoing, Mbig, Ui)
-    model.Cmax.setlb(max(Cmax_lb_jobs, int(LB_assign + 0.999)))
+    # 安全上界（绝不会剪掉真解）
+    UB_safe = int(ceil(sum(min(proc_time[(op, m)] for m in eligible[op]) for (op, _, _) in ops)))
 
-    # 3) Warm Start
-    warm_start(model, ops, eligible, proc_time)
+    # 3) 构建相邻弧结构 + 模型（用 UB_safe 来算 Big-M）
+    I_ops = [i for (i,_,_) in ops]
+    Vi, arcs_all, arcs_opop, in_keys, incoming, out_keys, outgoing, Mbig, Ui = \
+        build_adj_structures(I=I_ops, M=machines, eligible=eligible, ES=ES, H=H)
     
-    # 4) 导出 LP / MPS 到指定目录
+    # 结构一致性自检（非常重要）
+    assert sanity_check(Vi, arcs_all, incoming, outgoing), "Arc/degree structure inconsistent."
+
+    model = build_model_adj(
+        ops, eligible, proc_time, pred, machines, ES, UB_safe,
+        Vi, arcs_all, arcs_opop, in_keys, incoming, out_keys, outgoing, Mbig, Ui
+    )
+
+    # 设上下界（紧化但安全）
+    model.Cmax.setlb(Cmax_lb_init)
+    model.Cmax.setub(UB_safe)
+    for op in model.I:
+        model.S[op].setub(UB_safe)
+        model.C[op].setub(UB_safe)
+
+    # 4) Warm Start
+    # 4.1 初值和相邻弧
+    try:
+        warm_start(model, ops, eligible, proc_time) 
+    except Exception:
+        pass
+    # 4.2 贪心兜底（一定给出一个可行分配与时间）
+    try:
+        UB_greedy, x0, S0, C0 = greedy_feasible_schedule(ops, eligible, proc_time, pred, machines)
+        # 把贪心解写入变量
+        apply_warm_start(model, x0, S0, C0, UB=min(UB_safe, int(ceil(UB_greedy))))
+    except Exception as e:
+        print("[WARN] greedy_feasible_schedule failed:", e)
+    # 4.3 基于 S 的相邻顺序：给 y/u 初值
+    try:
+        warm_start_adj(model, ops, eligible, proc_time)  # 把同机的操作按 S 升序连成链，并给 MTZ 序
+    except Exception as e:
+        print("[WARN] warm_start_adj failed:", e)
+    
+    # 5) 导出 LP / MPS 到指定目录
     model.write(str(OUT_DIR / "model.mps"), format="mps")
 
-    # 5）调用Gurobi求解
-    solver = SolverFactory("gurobi")
-    solver.options["LogFile"]       = str(LOGS_DIR / f"{case_name}_gurobi.log")
-    solver.options["TimeLimit"]     = 300
-    solver.options["MIPGap"]        = 0.02
-    solver.options["Threads"]       = 16
-    solver.options["MIPFocus"]      = 1
-    solver.options["Heuristics"]    = 0.2
-    solver.options["Presolve"]      = 2
-    solver.options["Cuts"]          = 2
-    solver.options["NodefileStart"] = 0.5                     # 因为求解过程过长因此考虑中途保存记录
+    # 6）调用Gurobi求解
+    solver = SolverFactory("gurobi_persistent")
+    solver.set_instance(model)   # 把当前变量及其起点送入 Gurobi 内存
 
-    solver.options["ResultFile"] = str(OUT_DIR / "solution.sol")
+    # 日志与解文件
+    solver.set_gurobi_param("LogFile", str(LOGS_DIR / f"{case_name}_gurobi.log"))
+    solver.set_gurobi_param("ResultFile", str(OUT_DIR / "solution.sol"))
+    
+    # 第一轮：找可行解优先（180s）
+    solver.set_gurobi_param("TimeLimit", 180)
+    solver.set_gurobi_param("MIPFocus", 1)      # feasibility
+    solver.set_gurobi_param("Heuristics", 0.8)
+    solver.set_gurobi_param("PumpPasses", 50)
+    solver.set_gurobi_param("RINS", 10)
+    solver.set_gurobi_param("Presolve", 2)
+    solver.set_gurobi_param("Cuts", 2)
+    solver.set_gurobi_param("Symmetry", 2)
+    solver.set_gurobi_param("Threads", 16)
+    solver.set_gurobi_param("NodefileStart", 0.5)
 
-    result = solver.solve(model, tee=True)
-    print("Cmax =", value(model.Cmax))
-    print("LP/MPS/日志/解文件已导出到：", OUT_DIR.resolve(), LOGS_DIR.resolve())
+    # 显式 warm start
+    try:
+        solver.set_warm_start()
+    except Exception:
+        pass
 
-    # 5) 输出甘特 / 赋值表 / 元数据
-    export_gantt(model, ops, eligible, out_dir=OUT_DIR)
-    export_assignment_long(model, ops, eligible, out_dir=OUT_DIR)
-    export_assignment_wide(model, ops, eligible, out_dir=OUT_DIR)
-    export_metadata(model, result, out_dir=OUT_DIR,
-                    extra={"lp": str((OUT_DIR/"model.lp").resolve()),
-                           "mps": str((OUT_DIR/"model.mps").resolve()),
-                           "sol": str((OUT_DIR/"solution.sol").resolve()),
-                           "log": str((LOGS_DIR/f"{case_name}_gurobi.log").resolve())})
+    res1 = solver.solve(tee=True)
+
+    # 如果仍没有 incumbent，再“加大力度”尝试一次（120s）
+    if not has_incumbent(res1, model):
+        print("[INFO] No incumbent after phase-1. Strengthen heuristics and try again...")
+        # 再灌一次 warm start（可省略，但稳妥）
+        try:
+            UB_greedy2, x0b, S0b, C0b = greedy_feasible_schedule(ops, eligible, proc_time, pred, machines)
+            apply_warm_start(model, x0b, S0b, C0b, UB=min(UB_safe, int(ceil(UB_greedy2))))
+            warm_start_adj(model, ops, eligible, proc_time)
+        except Exception:
+            pass
+        try:
+            solver.set_warm_start()
+        except Exception:
+            pass
+
+        solver.set_gurobi_param("TimeLimit", 120)
+        solver.set_gurobi_param("MIPFocus", 1)
+        solver.set_gurobi_param("Heuristics", 0.9)
+        solver.set_gurobi_param("PumpPasses", 100)
+        solver.set_gurobi_param("RINS", 20)
+        res1b = solver.solve(tee=True)
+
+    # 第二轮：若已有解，则推界并设置 Cutoff；否则保持找解
+    have_inc = has_incumbent(res1, model) or ('res1b' in locals() and has_incumbent(res1b, model))
+    if have_inc:
+        UB_curr = float(value(model.Cmax))
+        # 推界（420s），设置 Cutoff 砍掉 ≥UB 的分支
+        solver.set_gurobi_param("Cutoff", UB_curr - 1e-6)
+        solver.set_gurobi_param("TimeLimit", 420)   # 总计约 600s
+        solver.set_gurobi_param("MIPFocus", 3)      # bound
+        solver.set_gurobi_param("Heuristics", 0.05)
+        res2 = solver.solve(tee=True)
+        result_for_meta = res2
+    else:
+        print("[WARN] Still no incumbent. Keeping feasibility mode for another 420s.")
+        solver.set_gurobi_param("TimeLimit", 420)
+        solver.set_gurobi_param("MIPFocus", 1)
+        solver.set_gurobi_param("Heuristics", 0.9)
+        res2 = solver.solve(tee=True)
+        result_for_meta = res2
+
+    # 7) 导出数据以及可视化
+    cmax_val = value(model.Cmax)
+    print("Cmax =", cmax_val)
+    
+    # 只有有解时才导出甘特/赋值，避免误导
+    if cmax_val is not None:
+        export_gantt(model, ops, eligible, out_dir=OUT_DIR)
+        export_assignment_long(model, ops, eligible, out_dir=OUT_DIR)
+        export_assignment_wide(model, ops, eligible, out_dir=OUT_DIR)
+    else:
+        print("[WARN] No feasible solution found. Skipping schedule exports.")
+
+    # 把本轮真实参数写进 meta（便于回溯）
+    solver_opts_dump = {
+        "phase1": {
+            "TimeLimit": 180, "MIPFocus": 1, "Heuristics": 0.8,
+            "PumpPasses": 50, "RINS": 10, "Presolve": 2, "Cuts": 2, "Symmetry": 2,
+            "Threads": 16, "NodefileStart": 0.5,
+        },
+        "phase1_retry_if_needed": {
+            "TimeLimit": 120, "MIPFocus": 1, "Heuristics": 0.9,
+            "PumpPasses": 100, "RINS": 20,
+        },
+        "phase2": {
+            "TimeLimit": 420, "MIPFocus": 3 if have_inc else 1,
+            "Heuristics": 0.05 if have_inc else 0.9,
+            "Cutoff": (float(cmax_val) - 1e-6) if cmax_val is not None else None
+        }
+    }
+    export_metadata(
+        model, result_for_meta,
+        out_dir=OUT_DIR,
+        solver_name="gurobi_persistent",
+        solver_options=solver_opts_dump,
+        extra={
+            "lp":  str((OUT_DIR/"model.lp").resolve()),
+            "mps": str((OUT_DIR/"model.mps").resolve()),
+            "sol": str((OUT_DIR/"solution.sol").resolve()),
+            "log": str((LOGS_DIR/f"{case_name}_gurobi.log").resolve()),
+        }
+    )
+    print("输出已导出到：", OUT_DIR.resolve(), LOGS_DIR.resolve())
 
 if __name__ == "__main__":
     main()
