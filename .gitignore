@@ -247,14 +247,14 @@ outputs/**/schedule_gantt.csv
 outputs/**/assignment_*.csv
 
 # === Default: ignore all figures
-outputs/**/figs/
+# outputs/**/figs/
 
 # --- Exception: keep mk01 figures as demo (for README) ---
-!outputs/mk01/
-outputs/mk01/*
-!outputs/mk01/figs/
-outputs/mk01/figs/*
-!outputs/mk01/figs/gantt_mk01.png
-!outputs/mk01/figs/util_mk01.png
-!outputs/mk01/figs/job_completion_mk01.png
-!outputs/mk01/figs/wip_mk01.png
+#!outputs/mk01/
+#outputs/mk01/*
+#!outputs/mk01/figs/
+#outputs/mk01/figs/*
+#!outputs/mk01/figs/gantt_mk01.png
+#!outputs/mk01/figs/util_mk01.png
+#!outputs/mk01/figs/job_completion_mk01.png
+#!outputs/mk01/figs/wip_mk01.png
