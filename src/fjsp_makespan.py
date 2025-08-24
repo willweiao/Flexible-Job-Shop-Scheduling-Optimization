@@ -460,7 +460,7 @@ def export_metadata(model, result, out_dir="outputs/mk01", extra=None):
 
 # ===== 9) 主程序：把以上步骤串起来 =====
 def main():
-    case_name = "mk02"  # 根据所运行的案例进行修改
+    case_name = "mk05"  # 根据所运行的案例进行修改
     OUT_DIR = Path(f"outputs/{case_name}")
     LOGS_DIR = Path("logs")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
