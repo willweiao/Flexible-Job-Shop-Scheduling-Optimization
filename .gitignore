@@ -245,6 +245,8 @@ outputs/**/run_meta.json
 outputs/**/viz_manifest.json
 outputs/**/schedule_gantt.csv
 outputs/**/assignment_*.csv
+outputs/mk03/warmstart_lp/
+outputs/**/*.csv
 
 # === Default: ignore all figures
 # outputs/**/figs/
@@ -258,3 +260,5 @@ outputs/**/assignment_*.csv
 #!outputs/mk01/figs/util_mk01.png
 #!outputs/mk01/figs/job_completion_mk01.png
 #!outputs/mk01/figs/wip_mk01.png
+
+src/visu.ipynb

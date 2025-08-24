@@ -14,6 +14,7 @@ import math
 import pandas as pd
 from math import ceil
 from pyomo.opt import TerminationCondition
+from pyomo.core import TransformationFactory 
 from pyomo.environ import (
     ConcreteModel, Set, Param, Var, NonNegativeReals, Binary,
     Objective, Constraint, minimize, SolverFactory, value
@@ -324,135 +325,328 @@ def build_model_adj(ops, eligible, proc_time, pred, machines, ES, H,
     return model
 
 
-# ===== Warm Start：给初值和相邻弧 =====
-def warm_start(model, ops, eligible, proc_time):
-    # x：每个操作分配到最短加工时间的机器
-    for (i, _, _) in ops:
-        m_star = min(eligible[i], key=lambda m: proc_time[(i, m)])
-        for m in eligible[i]:
-            if (i, m) in model.x:
-                model.x[(i, m)].value = 1.0 if m == m_star else 0.0
-
-    #  S/C：按作业顺序前推（不考虑同机冲突，仅给一个粗初值）
-    cur = defaultdict(float)
-    for _, j, k in sorted(ops, key=lambda t: (t[1], t[2])):
-        i = next(ii for (ii, jj, kk) in ops if jj == j and kk == k)
-        m_star = min(eligible[i], key=lambda m: proc_time[(i, m)])
-        p = proc_time[(i, m_star)]
-        model.S[i].value = cur[j]
-        model.C[i].value = cur[j] + p
-        cur[j] += p
-
-    model.Cmax.value = max(value(model.C[i]) for (i, _, _) in ops)
-
-
-def warm_start_adj(model, ops, eligible, proc_time):
-    from collections import defaultdict
-    by_m = defaultdict(list)
-    for (iop,_,_) in ops:
-        ms = [m for m in eligible[iop] if (iop,m) in model.x and (model.x[(iop,m)].value or 0)>0.5]
-        m_star = ms[0] if ms else min(eligible[iop], key=lambda mm: proc_time[(iop,mm)])
-        s_val = model.S[iop].value if model.S[iop].value is not None else 0.0
-        by_m[m_star].append((s_val, iop))
-    for m, lst in by_m.items():
-        lst.sort()
-        if lst and (m,'SRC',lst[0][1]) in model.y: model.y[(m,'SRC',lst[0][1])].value = 1.0
-        for (_,a),(_,b) in zip(lst, lst[1:]):
-            if (m,a,b) in model.y: model.y[(m,a,b)].value = 1.0
-        if lst and (m,lst[-1][1],'SNK') in model.y: model.y[(m,lst[-1][1],'SNK')].value = 1.0
-    # u 初值可按序号给：u[(m,op)]=rank
-    for m,lst in by_m.items():
-        for rank,(_,op) in enumerate(sorted(lst)):
-            if (m,op) in model.u: model.u[(m,op)].value = float(rank)
-
-
-# =====贪心调度生成快速可行解作为UB和MIPstart, 防止找不到incumbent报错跳出=====
-def _build_successor_map(ops):
-    # 每个 job 是线性工艺：为每个 op 建 succ（无则 None）
-    by_job = {}
-    for iop, j, k in ops:
-        by_job.setdefault(j, []).append((k, iop))
-    succ = {iop: None for (iop,_,_) in ops}
-    for j, lst in by_job.items():
-        lst.sort()
-        for t in range(len(lst)-1):
-            k, a = lst[t]
-            _, b = lst[t+1]
-            succ[a] = b
-    return succ
-
-def greedy_feasible_schedule(ops, eligible, proc_time, pred, machines):
+# =====Warm Start：从模型中提取 LP 松弛解=====
+def solve_lp_relaxation_and_extract(model, ops, eligible, out_dir: Path, case_name: str, timelimit=30, threads=16):
     """
-    简单双机贪心：就绪集合里选“最早可完成”的操作，
-    对每个操作在其可加工机器里挑  earliest_finish 最小的机器。
-    返回：UB, x0(op->m), S0(op->t), C0(op->t)
+    生成并求解 LP 放松；返回 (ok, relaxed, resLP, Sstar, xstar, obj_lp)。
+    同时把 LP 变量值落盘：Sstar_xstar_lp.csv。
     """
-    succ = _build_successor_map(ops)
-    avail = {m: 0.0 for m in machines}  # 每台机的可用时间
-    S0, C0, x0 = {}, {}, {}
+    # 1) 生成 LP 放松副本
+    try:
+        tf = TransformationFactory('core.relax_integer_vars')
+    except Exception:
+        tf = TransformationFactory('core.relax_int_vars')
+    relaxed = tf.create_using(model)
 
-    # 就绪集合：前序为 None 的操作
-    ready = {iop for (iop,_,_) in ops if pred[iop] is None}
-    done = set()
+    # 2) 求解 LP
+    lp_solver = SolverFactory("gurobi")
+    lp_solver.options.update({"TimeLimit": timelimit, "Presolve": 2, "Threads": threads, "LogFile": str(out_dir / f"{case_name}_lp.log")})
+    resLP = lp_solver.solve(relaxed, tee=False)
 
-    # 为了快速查 job / op 序号
-    job_of = {iop: j for (iop,j,_) in ops}
+    # 3) 取目标值
+    obj_comp = next((obj for obj in relaxed.component_objects(Objective, active=True)), None)
+    obj_lp = None if obj_comp is None else float(value(obj_comp.expr))
 
-    while ready:
-        # 为每个就绪操作计算在其可行机上的最早完成
-        best = None  # (finish, start, op, mach)
-        for op in list(ready):
-            pj = pred[op]
-            rel = 0.0 if pj is None else C0[pj]  # 就绪时间（前序完工）
-            for m in eligible[op]:
-                start = max(rel, avail[m])
-                fin = start + proc_time[(op, m)]
-                cand = (fin, start, op, m)
-                if (best is None) or cand < best:
-                    best = cand
-        fin, start, op, m = best
-        # 安排该操作
-        S0[op] = start
-        C0[op] = fin
-        x0[op] = m
-        avail[m] = fin
-        ready.remove(op)
-        done.add(op)
-        # 释放其后继（若有）
-        nxt = succ[op]
-        if nxt is not None and pred[nxt] in done:
-            ready.add(nxt)
+    # 4) 判定状态
+    tc = getattr(resLP.solver, "termination_condition", None)
+    ok = tc in {TerminationCondition.optimal, TerminationCondition.feasible, TerminationCondition.maxTimeLimit}
+    if not ok:
+        print(f"[LP] termination={tc}, obj={obj_lp}  -> LP 可能没成功。")
 
-        # 其它 job 中，若它们的前序也已经完成，随时进入就绪
-        for (iop,_,_) in ops:
-            if iop not in done and iop not in ready and (pred[iop] is None or pred[iop] in done):
-                ready.add(iop)
+    # 5) 提取 S*/x*
+    Sstar = {}
+    for (op,_,_) in ops:
+        try:
+            Sstar[op] = float(value(relaxed.S[op]) or 0.0)
+        except Exception:
+            Sstar[op] = 0.0
+
+    xstar = {}
+    for (op,_,_) in ops:
+        for i in eligible[op]:
+            try:
+                xstar[(op,i)] = float(value(relaxed.x[(op,i)]) or 0.0)
+            except Exception:
+                xstar[(op,i)] = 0.0
+
+    # 6) 落盘检查
+    rows = []
+    for (op, j, k) in ops:
+        rows.append({"op_id": op, "job": j, "op": k, "S_star": Sstar.get(op, 0.0)})
+        for i in eligible[op]:
+            rows.append({"op_id": op, "job": j, "op": k, "machine": i, "x_star": xstar.get((op,i), 0.0)})
+    df = pd.DataFrame(rows)
+    (out_dir).mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_dir / "Sstar_xstar_lp.csv", index=False, encoding="utf-8")
+    print(f"[LP] ok={ok}, obj={obj_lp}; S*/x* 已导出: {(out_dir /'Sstar_xstar_lp.csv').resolve()}")
+
+    return ok, relaxed, resLP, Sstar, xstar, obj_lp
+
+# LP 引导 + SSGS：构造严格可行的初解
+def lp_round_to_feasible(ops, eligible, proc_time, pred, machines,
+                         Sstar=None, xstar=None, tie_eps=1e-6):
+    """
+    用 LP 的 (S*, x*) 引导 SSGS，构造可行解：
+      - 先按 x* 确定每个操作的机器指派（平局用更短 p 打破）；
+      - 再用 SSGS 按 S* 的先后把操作逐个安排，保证：前后继、同机不重叠、C=S+p。
+    返回: (UB, x0, S0, C0)
+    """
+    # 0) LP 值兜底
+    if Sstar is None:  # 若调用方没传，就用 0
+        Sstar = {op:0.0 for (op,_,_) in ops}
+    if xstar is None:
+        xstar = {(op,i):0.0 for (op,_,_) in ops for i in eligible[op]}
+
+    # 1) 机器指派 x0：argmax_i x*(op,i)，平局用更小加工时间 p 打破
+    x0 = {}
+    for (op,_,_) in ops:
+        cand = []
+        for i in eligible[op]:
+            score = xstar.get((op,i), 0.0)
+            cand.append((score, -proc_time[(op,i)], i))  # 分数大优先，p 小优先
+        # 若全 0，则按最短 p 选一台
+        if not cand:
+            raise RuntimeError(f"op {op} has empty eligible set.")
+        score_max = max(c[0] for c in cand)
+        if score_max < tie_eps:
+            i_hat = min(eligible[op], key=lambda i: proc_time[(op,i)])
+        else:
+            # 先按分数降序，再按 p 升序
+            cand.sort(key=lambda t: (t[0], t[1]), reverse=False)  # 因为第二项是 -p
+            i_hat = max(cand, key=lambda t: (t[0], -t[1]))[2]    # 分数最大，若平局 p 最小
+        x0[op] = i_hat
+
+    # 2) 构造后继表与入度（基于 pred）
+    succ = {}
+    indeg = {op: 0 for (op,_,_) in ops}
+    for (op,_,_) in ops:
+        p = pred.get(op, None)
+        if p is not None:
+            succ.setdefault(p, []).append(op)
+            indeg[op] += 1
+
+    # 3) SSGS：机器就绪时间 & 作业就绪时间
+    RM = {i: 0.0 for i in machines}   # machine ready time
+    RJ = {}
+    job_of = {op: j for (op,j,_) in ops}
+    for _,j,_ in ops:
+        RJ.setdefault(j, 0.0)
+
+    # 初始就绪池：入度为 0 的首工序，按 S* 早的排前
+    Q = [op for (op,_,_) in ops if indeg[op] == 0]
+    Q.sort(key=lambda o: Sstar.get(o, 0.0))
+
+    S0, C0 = {}, {}
+    while Q:
+        o = Q.pop(0)
+        i_hat = x0[o]
+        s = max(RM[i_hat], RJ[job_of[o]])
+        p = proc_time[(o, i_hat)]
+        S0[o] = s
+        C0[o] = s + p
+        RM[i_hat] = C0[o]
+        RJ[job_of[o]] = C0[o]
+        for b in succ.get(o, []):
+            indeg[b] -= 1
+            if indeg[b] == 0:
+                # 维持按 S* 的优先顺序插入
+                insert_at = 0
+                Sb = Sstar.get(b, 0.0)
+                while insert_at < len(Q) and Sstar.get(Q[insert_at], 0.0) <= Sb:
+                    insert_at += 1
+                Q.insert(insert_at, b)
 
     UB = max(C0.values()) if C0 else 0.0
     return UB, x0, S0, C0
 
+def _clip(val, lo=None, hi=None):
+    if val is None: return None
+    if lo is not None: val = max(lo, val)
+    if hi is not None: val = min(hi, val)
+    return val
+
 def apply_warm_start(model, x0, S0, C0, UB=None):
-    """把贪心可行解灌进 Pyomo 变量（MIPStart）；可选同时设置 Cmax 的初值/上界。"""
+    """
+    把可行解灌进 Pyomo 变量，并把 S/C/Cmax 夹到模型边界内，避免 W1002。
+    """
     # x
     for key in model.x:
         op, m = key
         v = 1.0 if (op in x0 and x0[op] == m) else 0.0
         model.x[key].value = v
         model.x[key].stale = False
+
+    # 上界用于裁剪
+    cmax_lb = model.Cmax.lb if model.Cmax.has_lb() else 0.0
+    cmax_ub = model.Cmax.ub if model.Cmax.has_ub() else None
+
     # S, C
     for op in model.I:
         if op in S0:
-            model.S[op].value = float(S0[op]); model.S[op].stale = False
+            sv = _clip(float(S0[op]), 0.0, cmax_ub)
+            model.S[op].value = sv; model.S[op].stale = False
         if op in C0:
-            model.C[op].value = float(C0[op]); model.C[op].stale = False
-    # Cmax
+            cv = _clip(float(C0[op]), 0.0, cmax_ub)
+            model.C[op].value = cv; model.C[op].stale = False
+
+    # Cmax：取 max(下界, 估计 UB, 当前最大完工)
+    guess = cmax_lb
+    if C0:
+        try: guess = max(guess, max(float(C0[o]) for o in C0))
+        except Exception: pass
     if UB is not None:
+        try: guess = max(guess, float(UB))
+        except Exception: pass
+    if cmax_ub is not None:
+        guess = min(guess, float(cmax_ub))
+    model.Cmax.value = guess
+    model.Cmax.stale = False
+
+# 相邻弧 & MTZ 的暖启动
+def warm_start_adj(model, ops, eligible, proc_time):
+    """
+    度安全的 y/u MIPStart：
+      - 对每台机 i，取分配在 i 的操作按 S 升序得到序列 L；
+      - 对序列里每个 a，必须从 model._outgoing[(i,a)] 里选 exactly one b，
+        优先选“时间表中的下一个 op”（若那条弧存在）；若不存在，则：
+          * 若有 (i,a,'SNK') 就选 SNK；
+          * 否则在候选 b 中选 S[b] 最接近且 >= C[a] 的（找不到则任意一个），确保 sum_out = 1；
+      - 对序列里每个 b，入度也会随之满足 sum_in = 1；若首个 b 的 incoming 里没有 (i,'SRC',b)，
+        则从候选 incoming 里选时间上最合理的 a；最后兜底若还没有，再设 SRC。
+      - u 序变量按序号赋 0,1,2,...
+    """
+    # 拿 S 值、当前 x 选择
+    Sval = {op: float(value(model.S[op]) or 0.0) for (op,_,_) in ops}
+    Cval = {op: float(value(model.C[op]) or (Sval[op]+1.0)) for (op,_,_) in ops}
+    x_pick = {}
+    for (op,_,_) in ops:
+        chosen = [i for i in eligible[op] if (op,i) in model.x and (value(model.x[(op,i)]) or 0.0) > 0.5]
+        x_pick[op] = chosen[0] if chosen else None
+
+    # 清零所有 y
+    for key in model.ArcsAll:
         try:
-            model.Cmax.value = float(UB)
-            model.Cmax.stale = False
+            model.y[key].value = 0.0
+            model.y[key].stale = False
         except Exception:
             pass
 
+    # 按机构造序列并设置出度=1
+    by_m = {}
+    for (op,_,_) in ops:
+        i = x_pick.get(op, None)
+        if i is None: continue
+        by_m.setdefault(i, []).append(op)
+
+    for i, L in by_m.items():
+        L.sort(key=lambda o: (Sval[o], Cval[o]))
+
+        # 给 u
+        if hasattr(model, "u"):
+            for r, o in enumerate(L):
+                key = (i, o)
+                if key in model.u:
+                    model.u[key].value = float(r)
+                    model.u[key].stale = False
+
+        # 逐个 a 设出度
+        for idx, a in enumerate(L):
+            cand_out = list(model._outgoing.get((i,a), []))  # 候选 b，可能含 'SNK'
+            chosen_b = None
+
+            # 理想选择：时间表中的“下一个” b
+            if idx+1 < len(L):
+                b_next = L[idx+1]
+                if (i,a,b_next) in model.y:
+                    chosen_b = b_next
+
+            # 若理想弧不存在，尽量选 SNK
+            if chosen_b is None and (i,a,'SNK') in model.y:
+                chosen_b = 'SNK'
+
+            # 若还没有，挑个“最接近 C[a] 的 b”
+            if chosen_b is None:
+                # 在 cand_out 里剔除 'SNK'/'SRC'（不该出现 SRC）
+                real_bs = [b for b in cand_out if b not in ('SRC','SNK')]
+                if real_bs:
+                    # 选 S[b] >= C[a] 的最近者，否则 S[b] 最小者
+                    later = [b for b in real_bs if Sval[b] >= Cval[a] - 1e-9]
+                    if later:
+                        chosen_b = min(later, key=lambda b: (Sval[b]-Cval[a], Sval[b]))
+                    else:
+                        chosen_b = min(real_bs, key=lambda b: Sval[b])
+
+            # 兜底： cand_out 至少会有一个元素（建模应保证），随便选一个
+            if chosen_b is None and cand_out:
+                chosen_b = cand_out[0]
+
+            # 设 y=1
+            if chosen_b is not None and (i,a,chosen_b) in model.y:
+                model.y[(i,a,chosen_b)].value = 1.0
+                model.y[(i,a,chosen_b)].stale = False
+            else:
+                # 仍然没法设，打印一下方便排查
+                print(f"[WS-ADJ] cannot set out-arc for (i={i}, a={a}); outgoing={cand_out}")
+
+        # 处理首元素的入度（优先 SRC→first）
+        if L:
+            first = L[0]
+            cand_in = list(model._incoming.get((i, first), []))
+            if (i,'SRC',first) in model.y:
+                model.y[(i,'SRC',first)].value = 1.0
+                model.y[(i,'SRC',first)].stale = False
+            else:
+                # 选一个 a' 使得 C[a'] 最接近 S[first]
+                real_as = [a for a in cand_in if a not in ('SRC','SNK')]
+                if real_as:
+                    a_best = max(real_as, key=lambda a: (Cval[a] <= Sval[first], -abs(Cval[a]-Sval[first])))
+                    if (i,a_best,first) in model.y:
+                        model.y[(i,a_best,first)].value = 1.0
+                        model.y[(i,a_best,first)].stale = False
+
+# 起点一致性自检
+def check_warm_feasibility(ops, eligible, proc_time, pred, machines, x0, S0, C0, tol=1e-6):
+    ok = True
+    # 机器合法 & 唯一指派
+    for (op,_,_) in ops:
+        m = x0.get(op, None)
+        if m is None:
+            print(f"[WS-CHK] op {op} has no machine assignment"); ok=False; continue
+        if m not in eligible[op]:
+            print(f"[WS-CHK] op {op} assigned to ineligible machine {m}"); ok=False
+
+    # 完成等式
+    for (op,_,_) in ops:
+        if op in S0 and op in C0:
+            m = x0.get(op, None)
+            if m is None: continue
+            p = proc_time.get((op,m), None)
+            if p is None:
+                print(f"[WS-CHK] missing proc_time({op},{m})"); ok=False; continue
+            if abs(C0[op] - (S0[op] + p)) > tol:
+                print(f"[WS-CHK] op {op}: C!=S+p  C={C0[op]} S={S0[op]} p={p}"); ok=False
+
+    # 前后继
+    for (op,_,_) in ops:
+        pre = pred.get(op, None)
+        if pre is not None and (op in S0) and (pre in C0):
+            if S0[op] + tol < C0[pre]:
+                print(f"[WS-CHK] precedence violated: S[{op}]={S0[op]} < C[{pre}]={C0[pre]}"); ok=False
+
+    # 同机不重叠
+    by_m = {}
+    for (op,_,_) in ops:
+        m = x0.get(op, None)
+        if m is None: continue
+        by_m.setdefault(m, []).append(op)
+    for m, oplist in by_m.items():
+        seg = sorted(oplist, key=lambda o: S0[o])
+        for a, b in zip(seg, seg[1:]):
+            if S0[b] < C0[a] - tol:
+                print(f"[WS-CHK] overlap on machine {m}: "
+                      f"a={a}[{S0[a]},{C0[a]}), b={b}[{S0[b]},{C0[b]})")
+                ok=False
+    return ok
 
 # =====取解与快速可行性检查 =====
 def extract_schedule(model, ops, eligible):
@@ -476,7 +670,8 @@ def extract_schedule(model, ops, eligible):
 
     return schedule
 
-# —— 小工具：是否有 incumbent（可行解） ——
+# 工具模块函数
+# 是否有 incumbent（可行解）
 def has_incumbent(result, model):
     tc = getattr(result.solver, "termination_condition", None)
     if tc in {TerminationCondition.infeasible,
@@ -485,7 +680,7 @@ def has_incumbent(result, model):
         return False
     return value(model.Cmax) is not None
 
-# —— 小工具：弧/度一致性自检，避免“结构剪没了” ——
+# 弧/度一致性自检，避免“结构剪没了” 
 def sanity_check(Vi, arcs_all, incoming, outgoing):
     ok = True
     # 每台机要有 SRC→* 和 *→SNK
@@ -500,6 +695,126 @@ def sanity_check(Vi, arcs_all, incoming, outgoing):
             if not outgoing.get((i, op)):
                 print(f"[WARN] empty outgoing for (i={i}, op={op})"); ok = False
     return ok
+
+# 度约束的一致性自检，求解前跑一下它，马上能看到哪台机、哪个操作的入/出度不匹配
+def check_degree_balance(model, tol=1e-6, max_print=10):
+    """
+    检查入度/出度是否与 x 一致：
+      对所有 (i,a) & (i,b): sum_out y = x[a,i], sum_in y = x[b,i]
+    仅用于 warm start 之后、solve 之前做体检。
+    """
+    # 索引集合（提高判断速度）
+    x_idx = model.x.index_set()
+    y_idx = model.y.index_set() if hasattr(model, "y") else set()
+
+    def x_val(a, i):
+        # 若 (a,i) 不是 x 的索引，返回 0
+        if (a, i) in x_idx:
+            v = value(model.x[a, i])
+            return 0.0 if v is None else float(v)
+        return 0.0
+
+    def y_val(i, a, b):
+        if hasattr(model, "y") and (i, a, b) in y_idx:
+            v = value(model.y[i, a, b])
+            return 0.0 if v is None else float(v)
+        return 0.0
+
+    bad = 0
+
+    # 出度 = 指派
+    for (i, a) in model.OutKeys:
+        x_ai = x_val(a, i)
+        sum_y = 0.0
+        for b in model._outgoing.get((i, a), []):
+            sum_y += y_val(i, a, b)
+        if abs(sum_y - x_ai) > tol:
+            print(f"[DEG-CHK][OUT] (i={i}, a={a}): sum_y={sum_y} != x={x_ai}")
+            bad += 1
+            if bad >= max_print:
+                break
+
+    # 入度 = 指派
+    if bad < max_print:
+        for (i, b) in model.InKeys:
+            x_bi = x_val(b, i)
+            sum_y = 0.0
+            for a in model._incoming.get((i, b), []):
+                sum_y += y_val(i, a, b)
+            if abs(sum_y - x_bi) > tol:
+                print(f"[DEG-CHK][IN ] (i={i}, b={b}): sum_y={sum_y} != x={x_bi}")
+                bad += 1
+                if bad >= max_print:
+                    break
+
+    if bad == 0:
+        print("[DEG-CHK] degree balance OK for warm start.")
+    else:
+        print(f"[DEG-CHK] found {bad} degree mismatches (showing up to {max_print}).")
+
+# 检查排程可行性以及相邻弧度约束与指派一致性（和模型里的 y 集合强相关）
+def count_schedule_conflicts(ops, eligible, proc_time, pred, x0, S0, C0, tol=1e-6):
+    """
+    返回一个 dict：三类冲突的数量与列表：
+      - bad_eq: C!=S+p 的操作列表
+      - bad_pre: 违反工序先后的 (pre, op) 列表
+      - bad_ovl: 同机重叠对 [(i, a, b, [Sa,Ca), [Sb,Cb))]
+    """
+    job_of = {op: j for (op,j,_) in ops}
+    # 完成等式
+    bad_eq = []
+    for (op,_,_) in ops:
+        m = x0.get(op, None)
+        if m is None or op not in S0 or op not in C0: 
+            bad_eq.append(op); continue
+        p = proc_time.get((op, m), None)
+        if p is None or abs(C0[op] - (S0[op] + p)) > tol:
+            bad_eq.append(op)
+
+    # 先后关系
+    bad_pre = []
+    for (op,_,_) in ops:
+        pre = pred.get(op, None)
+        if pre is None: continue
+        if (op in S0) and (pre in C0):
+            if S0[op] + tol < C0[pre]:
+                bad_pre.append((pre, op))
+
+    # 同机重叠
+    by_m = {}
+    for (op,_,_) in ops:
+        i = x0.get(op, None)
+        if i is not None and op in S0 and op in C0:
+            by_m.setdefault(i, []).append(op)
+
+    bad_ovl = []
+    for i, oplist in by_m.items():
+        seg = sorted(oplist, key=lambda o: (S0[o], C0[o]))
+        for a, b in zip(seg, seg[1:]):
+            if S0[b] < C0[a] - tol:
+                bad_ovl.append((i, a, b, (S0[a], C0[a]), (S0[b], C0[b])))
+
+    return {
+        "bad_eq_count": len(bad_eq), "bad_eq_ops": bad_eq,
+        "bad_pre_count": len(bad_pre), "bad_pre_pairs": bad_pre,
+        "bad_ovl_count": len(bad_ovl), "bad_ovl_pairs": bad_ovl,
+    }
+
+def summarize_schedule_ok(ops, eligible, proc_time, pred, x0, S0, C0):
+    info = count_schedule_conflicts(ops, eligible, proc_time, pred, x0, S0, C0)
+    ok = (info["bad_eq_count"]==0 and info["bad_pre_count"]==0 and info["bad_ovl_count"]==0)
+    if ok:
+        print("[SSGS] 可行性 OK：无完成等式/先后/重叠冲突。")
+    else:
+        print(f"[SSGS] 不可行：C!=S+p: {info['bad_eq_count']}，先后冲突: {info['bad_pre_count']}，重叠: {info['bad_ovl_count']}")
+        # 打印前几个例子
+        if info["bad_eq_count"]>0:
+            print("  例：", info["bad_eq_ops"][:5])
+        if info["bad_pre_count"]>0:
+            print("  例：", info["bad_pre_pairs"][:5])
+        if info["bad_ovl_count"]>0:
+            print("  例：", info["bad_ovl_pairs"][:3])
+    return ok, info
 
 
 # ===== 8) 保存结果进行数据分析 =====
@@ -594,11 +909,13 @@ def export_metadata(model, result, out_dir="outputs/mk01", solver_name="gurobi",
 
 # ===== 9) 主程序：把以上步骤串起来 =====
 def main():
-    case_name = "mk06"  # 根据所运行的案例进行修改
+    case_name = "mk03"  # 根据所运行的案例进行修改
     OUT_DIR = Path(f"outputs/{case_name}")
     LOGS_DIR = Path("logs")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    warm_dir = OUT_DIR / "warmstart_lp"
+    warm_dir.mkdir(parents=True, exist_ok=True)
 
     # 1) 读取数据
     routing_csv = Path(f"data/processed/brandimarte/{case_name}/routing.csv")
@@ -643,29 +960,46 @@ def main():
         model.S[op].setub(UB_safe)
         model.C[op].setub(UB_safe)
 
-    # 4) Warm Start
-    # 4.1 初值和相邻弧
-    try:
-        warm_start(model, ops, eligible, proc_time) 
-    except Exception:
-        pass
-    # 4.2 贪心兜底（一定给出一个可行分配与时间）
-    try:
-        UB_greedy, x0, S0, C0 = greedy_feasible_schedule(ops, eligible, proc_time, pred, machines)
-        # 把贪心解写入变量
-        apply_warm_start(model, x0, S0, C0, UB=min(UB_safe, int(ceil(UB_greedy))))
-    except Exception as e:
-        print("[WARN] greedy_feasible_schedule failed:", e)
-    # 4.3 基于 S 的相邻顺序：给 y/u 初值
-    try:
-        warm_start_adj(model, ops, eligible, proc_time)  # 把同机的操作按 S 升序连成链，并给 MTZ 序
-    except Exception as e:
-        print("[WARN] warm_start_adj failed:", e)
+    # 4) 先解一个 LP 松弛，提取 S*/x*，再用 SSGS 构造严格可行起点
+    okLP, relaxed, resLP, Sstar, xstar, obj_lp = solve_lp_relaxation_and_extract(model, ops, eligible, OUT_DIR, case_name, timelimit=30, threads=16)
+    if not okLP:
+        print("[LP] 松弛求解未成功（见 logs 以及 Sstar_xstar_lp.csv），后续暖启动可能无效。")
+    else:
+        print("LP求解OK")
+
+    # 用 LP 引导的 SSGS 生成可行解；若 LP 解无效则会退化为基于 eligible/p 的 SSGS
+    UB_ws, x0, S0, C0 = lp_round_to_feasible(
+        ops, eligible, proc_time, pred, machines,
+        Sstar=Sstar, xstar=xstar
+    )
+    ok_sched, sched_info = summarize_schedule_ok(ops, eligible, proc_time, pred, x0, S0, C0)
+    if not ok_sched:
+        print("[HINT] LP→SSGS 仍不满足基本可行性，请先修这里（通常是 pred 或 eligible/p 的不一致）。")
+    else:
+        print()
+
+    ok_ws = check_warm_feasibility(ops, eligible, proc_time, pred, machines, x0, S0, C0)
+    if ok_ws:
+        UB_guess = max(Cmax_lb_init, int(math.ceil(UB_ws)))
+        apply_warm_start(model, x0, S0, C0, UB=UB_guess)
+        export_gantt(model, ops, eligible, out_dir=warm_dir)
+        export_assignment_long(model, ops, eligible, out_dir=warm_dir)
+        export_assignment_wide(model, ops, eligible, out_dir=warm_dir)
+        print("[WARM-EXPORT] LP→SSGS 的排程 CSV 已输出到：", warm_dir.resolve())
+        try:
+            warm_start_adj(model, ops, eligible, proc_time)  # 若模型有 y/u
+        except Exception as e:
+            print("[WARN] warm_start_adj failed:", e)
+    else:
+        print("[INFO] LP-guided warm start invalid. Proceeding WITHOUT any warm start.")
     
+    # solve 前做一次度检查
+    check_degree_balance(model)
+
     # 5) 导出 LP / MPS 到指定目录
     model.write(str(OUT_DIR / "model.mps"), format="mps")
 
-    # 6）调用Gurobi求解
+    # 6）gurobi_persistent 两阶段求解
     solver = SolverFactory("gurobi_persistent")
     solver.set_instance(model)   # 把当前变量及其起点送入 Gurobi 内存
 
@@ -673,67 +1007,45 @@ def main():
     solver.set_gurobi_param("LogFile", str(LOGS_DIR / f"{case_name}_gurobi.log"))
     solver.set_gurobi_param("ResultFile", str(OUT_DIR / "solution.sol"))
     
-    # 第一轮：找可行解优先（180s）
-    solver.set_gurobi_param("TimeLimit", 180)
-    solver.set_gurobi_param("MIPFocus", 1)      # feasibility
-    solver.set_gurobi_param("Heuristics", 0.8)
-    solver.set_gurobi_param("PumpPasses", 50)
-    solver.set_gurobi_param("RINS", 10)
-    solver.set_gurobi_param("Presolve", 2)
-    solver.set_gurobi_param("Cuts", 2)
-    solver.set_gurobi_param("Symmetry", 2)
-    solver.set_gurobi_param("Threads", 16)
+    solver.set_gurobi_param("Presolve",   2)
+    solver.set_gurobi_param("Cuts",       2)
+    solver.set_gurobi_param("Symmetry",   2)
+    solver.set_gurobi_param("Threads",    16)
     solver.set_gurobi_param("NodefileStart", 0.5)
 
     # 显式 warm start
-    try:
-        solver.set_warm_start()
-    except Exception:
-        pass
-
-    res1 = solver.solve(tee=True)
-
-    # 如果仍没有 incumbent，再“加大力度”尝试一次（120s）
-    if not has_incumbent(res1, model):
-        print("[INFO] No incumbent after phase-1. Strengthen heuristics and try again...")
-        # 再灌一次 warm start（可省略，但稳妥）
-        try:
-            UB_greedy2, x0b, S0b, C0b = greedy_feasible_schedule(ops, eligible, proc_time, pred, machines)
-            apply_warm_start(model, x0b, S0b, C0b, UB=min(UB_safe, int(ceil(UB_greedy2))))
-            warm_start_adj(model, ops, eligible, proc_time)
-        except Exception:
-            pass
+    if ok_ws:
         try:
             solver.set_warm_start()
         except Exception:
             pass
+    
+    # Phase-1：找可行解优先（180s）
+    solver.set_gurobi_param("TimeLimit",  180)
+    solver.set_gurobi_param("MIPFocus",   1)
+    solver.set_gurobi_param("Heuristics", 0.8)
+    solver.set_gurobi_param("PumpPasses", 50)
+    solver.set_gurobi_param("RINS",       10)
+    res1 = solver.solve(tee=True)
 
-        solver.set_gurobi_param("TimeLimit", 120)
-        solver.set_gurobi_param("MIPFocus", 1)
-        solver.set_gurobi_param("Heuristics", 0.9)
-        solver.set_gurobi_param("PumpPasses", 100)
-        solver.set_gurobi_param("RINS", 20)
-        res1b = solver.solve(tee=True)
-
-    # 第二轮：若已有解，则推界并设置 Cutoff；否则保持找解
-    have_inc = has_incumbent(res1, model) or ('res1b' in locals() and has_incumbent(res1b, model))
-    if have_inc:
+    # Phase-2：若已有解则推界（420s + Cutoff），否则继续找解
+    result_for_meta = res1
+    if has_incumbent(res1):
         UB_curr = float(value(model.Cmax))
-        # 推界（420s），设置 Cutoff 砍掉 ≥UB 的分支
         solver.set_gurobi_param("Cutoff", UB_curr - 1e-6)
-        solver.set_gurobi_param("TimeLimit", 420)   # 总计约 600s
-        solver.set_gurobi_param("MIPFocus", 3)      # bound
+        solver.set_gurobi_param("TimeLimit", 420)
+        solver.set_gurobi_param("MIPFocus",  3)
         solver.set_gurobi_param("Heuristics", 0.05)
         res2 = solver.solve(tee=True)
         result_for_meta = res2
     else:
-        print("[WARN] Still no incumbent. Keeping feasibility mode for another 420s.")
+        print("[WARN] No incumbent after phase-1. Staying in feasibility mode for another 420s.")
         solver.set_gurobi_param("TimeLimit", 420)
-        solver.set_gurobi_param("MIPFocus", 1)
+        solver.set_gurobi_param("MIPFocus",  1)
         solver.set_gurobi_param("Heuristics", 0.9)
         res2 = solver.solve(tee=True)
         result_for_meta = res2
-
+    
     # 7) 导出数据以及可视化
     cmax_val = value(model.Cmax)
     print("Cmax =", cmax_val)
@@ -753,14 +1065,11 @@ def main():
             "PumpPasses": 50, "RINS": 10, "Presolve": 2, "Cuts": 2, "Symmetry": 2,
             "Threads": 16, "NodefileStart": 0.5,
         },
-        "phase1_retry_if_needed": {
-            "TimeLimit": 120, "MIPFocus": 1, "Heuristics": 0.9,
-            "PumpPasses": 100, "RINS": 20,
-        },
         "phase2": {
-            "TimeLimit": 420, "MIPFocus": 3 if have_inc else 1,
-            "Heuristics": 0.05 if have_inc else 0.9,
-            "Cutoff": (float(cmax_val) - 1e-6) if cmax_val is not None else None
+            "TimeLimit": 420,
+            "MIPFocus": 3 if has_incumbent(res1) else 1,
+            "Heuristics": 0.05 if has_incumbent(res1) else 0.9,
+            "Cutoff": (float(cmax_val) - 1e-6) if (cmax_val is not None and has_incumbent(res1)) else None
         }
     }
     export_metadata(
@@ -773,6 +1082,11 @@ def main():
             "mps": str((OUT_DIR/"model.mps").resolve()),
             "sol": str((OUT_DIR/"solution.sol").resolve()),
             "log": str((LOGS_DIR/f"{case_name}_gurobi.log").resolve()),
+            "lb_job": int(LB_job),
+            "lb_assign": int(ceil(LB_assign)),
+            "lb_init": int(Cmax_lb_init),
+            "ub_safe": int(UB_safe),
+            "warm_start_from_lp": bool(ok_ws),
         }
     )
     print("输出已导出到：", OUT_DIR.resolve(), LOGS_DIR.resolve())
