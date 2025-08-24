@@ -17,7 +17,7 @@ from pyomo.environ import (
     Objective, Constraint, minimize, SolverFactory, value
 )
 
-# ===== 1) 读取 routing.csv 并构建基础数据 =====
+# ===== 读取 routing.csv 并构建基础数据 =====
 def load_routing(routing_csv: Path):
     """
     读取 routing.csv，返回：
@@ -51,8 +51,31 @@ def load_routing(routing_csv: Path):
     machines = sorted({m for em in eligible.values() for m in em})
     return ops, eligible, proc_time, pred, machines, jk2i
 
+# 在 MILP 的 LP 松弛里，二元 x 变成分数，LP 实际上是在解一个“分数指派 + 机器容量”的线性松弛。
+# 在完全可分配（允许拆分）且无排序冲突的理想情况下，机器容量逼出的最小完工时间
+def compute_assignment_LB(ops, eligible, proc_time, machines):
+    O = [iop for (iop,_,_) in ops]
+    model = ConcreteModel()
+    model.O = Set(initialize=O)
+    model.M = Set(initialize=machines)
+    # 连续松弛变量（允许分数指派）
+    X_index = [(op,i) for op in O for i in eligible[op]]
+    model.x = Var(X_index, domain=NonNegativeReals)
+    model.T = Var(domain=NonNegativeReals)
 
-# ===== 2) 计算紧化用下界 ES 和总上界 H =====
+    def assign_rule(m, op):
+        return sum(m.x[(op,i)] for i in eligible[op]) == 1
+    model.Assign = Constraint(model.O, rule=assign_rule)
+
+    def cap_rule(m, i):
+        return sum(proc_time[(op,i)]*m.x[(op,i)] for op in O if (op,i) in m.x) <= m.T
+    model.Cap = Constraint(model.M, rule=cap_rule)
+
+    model.OBJ = Objective(expr=model.T, sense=minimize)
+    SolverFactory("gurobi").solve(model, tee=False)
+    return float(value(model.T))
+
+# ===== 计算紧化用下界 ES 和总上界 H =====
 def bounds_for_bigM(ops, eligible, proc_time):
     """
     返回：
@@ -77,7 +100,7 @@ def bounds_for_bigM(ops, eligible, proc_time):
     return pmin, ES, H
 
 
-# ===== 3) 生成“相邻弧”结构 =====
+# ===== 生成“相邻弧”结构 =====
 def build_adj_structures(I, M, eligible, ES, H):
     """
     相邻序列建模所需的结构：
@@ -127,7 +150,7 @@ def build_adj_structures(I, M, eligible, ES, H):
 
     return Vi, arcs_all, arcs_opop, in_keys, incoming, out_keys, outgoing, Mbig, Ui
 
-# ===== 4) 建 Pyomo 模型 =====
+# ===== 建 Pyomo 模型 =====
 def build_model_adj(ops, eligible, proc_time, pred, machines, ES, H,
                     Vi, arcs_all, arcs_opop, in_keys, incoming, out_keys, outgoing, Mbig, Ui):
     """
@@ -172,6 +195,8 @@ def build_model_adj(ops, eligible, proc_time, pred, machines, ES, H,
     # MTZ 序变量（机级）：索引为 (i, op) 仅对真实操作
     UIndex = [(i, op) for i in M for op in Vi[i]]
     model.UIndex = Set(dimen=2, initialize=UIndex)
+    # 机器是否被使用的二元变量（确保每台机至多/恰好一条链）
+    model.w = Var(model.M, domain=Binary)
 
     def u_bounds(m, i, op):
         return (0.0, float(Ui[i]))
@@ -216,13 +241,67 @@ def build_model_adj(ops, eligible, proc_time, pred, machines, ES, H,
         return sum(m.y[(i, a, b)] for b in m._outgoing[(i, a)]) == m.x[(a, i)]
     model.OutDeg = Constraint(model.OutKeys, rule=outdeg_rule)
 
-    # 7) MTZ 防子环（机级）
+    # 7) MTZ 防子环（base on machine）
     #    u_{i,b} >= u_{i,a} + 1 - Ui[i]*(1 - y_{i,a,b})，仅对 操作->操作 弧
     def mtz_rule(m, i, a, b):
         return m.u[(i, b)] >= m.u[(i, a)] + 1 - Ui[i] * (1 - m.y[(i, a, b)])
     model.MTZ = Constraint(model.ArcsOpOp, rule=mtz_rule)
-
+    
     # 8) makespan：对每个作业末工序
+    jobs = {}
+    for iop, j, k in ops:
+        jobs.setdefault(j, []).append((k, iop))
+    i_end_list = [iop for j, ks in jobs.items() for (_, iop) in [max(ks)]]
+
+    # 以下9）~ 12）约束是新增的为了防止出现重叠并行任务
+    # 9）源点 SRC 的“起点数” = w[i]（有链才有一个起点）
+    def src_degree_rule(m, i):
+        terms = [m.y[(i, 'SRC', b)]
+                 for (ii, a, b) in m.ArcsAll
+                 if ii == i and a == 'SRC' and b != 'SNK']
+        if len(terms) == 0:
+            # 这台机本身就没有可加工的操作
+            return m.w[i] == 0
+        return sum(terms) == m.w[i]
+    model.SrcDegree = Constraint(model.M, rule=src_degree_rule)
+
+    # 10）汇点 SNK 的“终点数” = w[i]
+    def snk_degree_rule(m, i):
+        terms = [m.y[(i, a, 'SNK')]
+                 for (ii, a, b) in m.ArcsAll
+                 if ii == i and b == 'SNK' and a != 'SRC']
+        if len(terms) == 0:
+            return m.w[i] == 0
+        return sum(terms) == m.w[i]
+    model.SnkDegree = Constraint(model.M, rule=snk_degree_rule)
+
+    # 11）x ⇒ w（有任意指派则 w[i] 必须为 1）
+    def x_implies_w_rule(m, i):
+        Vi_size = len(Vi[i])
+        if Vi_size == 0:
+            return m.w[i] == 0
+        return sum(m.x[(op, i)] for op in Vi[i]) <= Vi_size * m.w[i]
+    model.XImpliesW = Constraint(model.M, rule=x_implies_w_rule)
+
+    # 12）w ⇒ x（w[i]=1 时至少有一个指派，避免“空链”）
+    def w_implies_x_rule(m, i):
+        if len(Vi[i]) == 0:
+            return m.w[i] == 0
+        return m.w[i] <= sum(m.x[(op, i)] for op in Vi[i])
+    model.WImpliesX = Constraint(model.M, rule=w_implies_x_rule)
+
+    # 以下两个约束13）和14）是为了加强模型下界，减少剪枝的复杂度
+    # 13）机器负荷下界：每台机 i：Σ_{op∈Vi[i]} p_{i,op} * x[(op,i)] <= Cmax
+    def load_rule(m, i):
+        # Vi 和 p_im 是 build_model_adj 里已有的局部变量（上文构造过）
+        return sum(p_im[(op, i)] * m.x[(op, i)] for op in Vi[i]) <= m.Cmax
+    model.MachineLoad = Constraint(model.M, rule=load_rule)
+
+    # 14）最早开始/最早完成的显式下界：把预处理得到的 ES（earliest start）加进模型，能帮 LP 找到更紧的时间窗口
+    def es_rule(m, op):
+        return m.S[op] >= ES[op]   # ES 作为 build_model_adj 的入参已经传进来
+    model.EarliestStart = Constraint(model.I, rule=es_rule)
+
     jobs = {}
     for iop, j, k in ops:
         jobs.setdefault(j, []).append((k, iop))
@@ -243,16 +322,16 @@ def build_model_adj(ops, eligible, proc_time, pred, machines, ES, H,
     return model
 
 
-# ===== 5) Warm Start：给初值和相邻弧 =====
+# ===== Warm Start：给初值和相邻弧 =====
 def warm_start(model, ops, eligible, proc_time):
-    # 5.1 x：每个操作分配到最短加工时间的机器
+    # x：每个操作分配到最短加工时间的机器
     for (i, _, _) in ops:
         m_star = min(eligible[i], key=lambda m: proc_time[(i, m)])
         for m in eligible[i]:
             if (i, m) in model.x:
                 model.x[(i, m)].value = 1.0 if m == m_star else 0.0
 
-    # 5.2 S/C：按作业顺序前推（不考虑同机冲突，仅给一个粗初值）
+    #  S/C：按作业顺序前推（不考虑同机冲突，仅给一个粗初值）
     cur = defaultdict(float)
     for _, j, k in sorted(ops, key=lambda t: (t[1], t[2])):
         i = next(ii for (ii, jj, kk) in ops if jj == j and kk == k)
@@ -285,24 +364,7 @@ def warm_start_adj(model, ops, eligible, proc_time):
             if (m,op) in model.u: model.u[(m,op)].value = float(rank)
 
 
-# ===== 6) 求解（使用 Gurobi） =====
-def solve_with_gurobi(model, time_limit=300, mip_gap=0.02, threads=8,
-                      mip_focus=1, heuristics=0.2, presolve=2, cuts=2, log_file=None):
-    solver = SolverFactory("gurobi")
-    solver.options["TimeLimit"] = time_limit
-    solver.options["MIPGap"] = mip_gap
-    solver.options["Threads"] = threads
-    solver.options["MIPFocus"] = mip_focus
-    solver.options["Heuristics"] = heuristics
-    solver.options["Presolve"] = presolve
-    solver.options["Cuts"] = cuts
-    if log_file:
-        solver.options["LogFile"] = str(log_file)
-    result = solver.solve(model, tee=True)
-    return result
-
-
-# ===== 7) 取解与快速可行性检查 =====
+# =====取解与快速可行性检查 =====
 def extract_schedule(model, ops, eligible):
     # 提取每个操作的分配机台与时间
     assignment = {}
@@ -404,36 +466,58 @@ def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
-    routing_csv = Path("data/processed/brandimarte/mk01/routing.csv")  # <<< 改成你的路径
+    # 1) 读取数据
+    routing_csv = Path(f"data/processed/brandimarte/{case_name}/routing.csv")
     assert routing_csv.exists(), f"routing.csv not found: {routing_csv}"
 
-    # 1) 读取数据、建模 
-    routing_csv = Path(f"data/processed/brandimarte/{case_name}/routing.csv")
+    # 2）建模
     ops, eligible, proc_time, pred, machines, jk2i = load_routing(routing_csv)
     pmin, ES, H = bounds_for_bigM(ops, eligible, proc_time)
     I_ops = [i for (i,_,_) in ops]
     Vi, arcs_all, arcs_opop, in_keys, incoming, out_keys, outgoing, Mbig, Ui = \
         build_adj_structures(I=I_ops, M=machines, eligible=eligible, ES=ES, H=H)
+    
+    # 为了更有效地推下界，考虑基于 routing.csv 的数据计算每个作业的最短加工时间之和并取最大，作为全局 Cmax 的下界
+    # ops: list of (op_id, job, ord), eligible: {op_id: [machines]}, proc_time: {(op_id, m): p}
+    # 按作业分组
+    job_ops = {}
+    for iop, j, k in ops:
+        job_ops.setdefault(j, []).append(iop)
+
+    # 每个操作的“最短可加工时间”（在可行机里取 min）
+    op_min_p = {}
+    for j, oplist in job_ops.items():
+        for op in oplist:
+            op_min_p[op] = min(proc_time[(op, m)] for m in eligible[op])
+
+    # 每个作业的最短总工时 & 全局下界
+    LB_job = {j: sum(op_min_p[op] for op in oplist) for j, oplist in job_ops.items()}
+    Cmax_lb_jobs = max(LB_job.values())
+
+    # 计算机器容量分配的赋值松弛下界（preemptive的情形）
+    LB_assign = compute_assignment_LB(ops, eligible, proc_time, machines)
 
     model = build_model_adj(ops, eligible, proc_time, pred, machines, ES, H,
                         Vi, arcs_all, arcs_opop, in_keys, incoming, out_keys, outgoing, Mbig, Ui)
-    
-    # 2) Warm Start
+    model.Cmax.setlb(max(Cmax_lb_jobs, int(LB_assign + 0.999)))
+
+    # 3) Warm Start
     warm_start(model, ops, eligible, proc_time)
     
-    # 3) 导出 LP / MPS 到指定目录
+    # 4) 导出 LP / MPS 到指定目录
     model.write(str(OUT_DIR / "model.mps"), format="mps")
 
-    # 4）调用Gurobi求解
+    # 5）调用Gurobi求解
     solver = SolverFactory("gurobi")
-    solver.options["LogFile"]    = str(LOGS_DIR / f"{case_name}_gurobi.log")
-    solver.options["TimeLimit"]  = 300
-    solver.options["MIPGap"]     = 0.02
-    solver.options["Threads"]    = 16
-    solver.options["MIPFocus"]   = 1
-    solver.options["Heuristics"] = 0.2
-    solver.options["Presolve"]   = 2
-    solver.options["Cuts"]       = 2
+    solver.options["LogFile"]       = str(LOGS_DIR / f"{case_name}_gurobi.log")
+    solver.options["TimeLimit"]     = 300
+    solver.options["MIPGap"]        = 0.02
+    solver.options["Threads"]       = 16
+    solver.options["MIPFocus"]      = 1
+    solver.options["Heuristics"]    = 0.2
+    solver.options["Presolve"]      = 2
+    solver.options["Cuts"]          = 2
+    solver.options["NodefileStart"] = 0.5                     # 因为求解过程过长因此考虑中途保存记录
 
     solver.options["ResultFile"] = str(OUT_DIR / "solution.sol")
 
