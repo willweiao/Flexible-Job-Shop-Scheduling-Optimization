@@ -12,8 +12,9 @@ from pathlib import Path
 from collections import defaultdict
 import math
 import pandas as pd
-from math import ceil
-from pyomo.opt import TerminationCondition
+import pyomo.environ as pyo
+from math import ceil, isfinite
+from pyomo.opt import TerminationCondition as TC, SolverStatus as SS
 from pyomo.core import TransformationFactory 
 from pyomo.environ import (
     ConcreteModel, Set, Param, Var, NonNegativeReals, Binary,
@@ -349,7 +350,7 @@ def solve_lp_relaxation_and_extract(model, ops, eligible, out_dir: Path, case_na
 
     # 4) 判定状态
     tc = getattr(resLP.solver, "termination_condition", None)
-    ok = tc in {TerminationCondition.optimal, TerminationCondition.feasible, TerminationCondition.maxTimeLimit}
+    ok = tc in {TC.optimal, TC.feasible, TC.maxTimeLimit}
     if not ok:
         print(f"[LP] termination={tc}, obj={obj_lp}  -> LP 可能没成功。")
 
@@ -672,13 +673,42 @@ def extract_schedule(model, ops, eligible):
 
 # 工具模块函数
 # 是否有 incumbent（可行解）
-def has_incumbent(result, model):
+def has_incumbent(result, model=None):
     tc = getattr(result.solver, "termination_condition", None)
-    if tc in {TerminationCondition.infeasible,
-              TerminationCondition.unbounded,
-              TerminationCondition.infeasibleOrUnbounded}:
+    st = getattr(result.solver, "status", None)
+
+    # 用字符串名字来兼容不同 Pyomo 版本
+    tcname = getattr(tc, "name", str(tc)) if tc is not None else None
+
+    # 明确排除无解情形
+    if tcname in {"infeasible", "unbounded", "infeasibleOrUnbounded"}:
         return False
-    return value(model.Cmax) is not None
+
+    # 只要 solver 回了 solution 列表，就算有 incumbent
+    if hasattr(result, "solution") and result.solution:
+        try:
+            if len(result.solution) > 0:
+                return True
+        except Exception:
+            pass
+
+    # 接受这些“有解但未证最优/被打断”的终止情形
+    # 注意用字符串名而不是枚举常量，避免 AttributeError
+    if st in (SS.ok, SS.aborted) and tcname in {
+        "maxTime", "maxIterations", "other", "feasible", "userInterrupt"
+    }:
+        return True
+
+    # 兜底：如果已经 load_vars()，Cmax 有有限值也算有解
+    if model is not None:
+        try:
+            v = pyo.value(model.Cmax)
+            if v is not None and float(v) < float("inf"):
+                return True
+        except Exception:
+            pass
+
+    return False
 
 # 弧/度一致性自检，避免“结构剪没了” 
 def sanity_check(Vi, arcs_all, incoming, outgoing):
@@ -909,7 +939,7 @@ def export_metadata(model, result, out_dir="outputs/mk01", solver_name="gurobi",
 
 # ===== 9) 主程序：把以上步骤串起来 =====
 def main():
-    case_name = "mk03"  # 根据所运行的案例进行修改
+    case_name = "mk05"  # 根据所运行的案例进行修改
     OUT_DIR = Path(f"outputs/{case_name}")
     LOGS_DIR = Path("logs")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -979,6 +1009,7 @@ def main():
         print()
 
     ok_ws = check_warm_feasibility(ops, eligible, proc_time, pred, machines, x0, S0, C0)
+    # print(f"[DEBUG] ok_ws={ok_ws}")
     if ok_ws:
         UB_guess = max(Cmax_lb_init, int(math.ceil(UB_ws)))
         apply_warm_start(model, x0, S0, C0, UB=UB_guess)
@@ -993,6 +1024,15 @@ def main():
     else:
         print("[INFO] LP-guided warm start invalid. Proceeding WITHOUT any warm start.")
     
+    # === 调试：统计有值的整数变量 ===
+    n_int = n_int_with_val = 0
+    for v in model.component_data_objects(Var, descend_into=True):
+        if v.is_binary() or v.is_integer():
+            n_int += 1
+            if v.value is not None:
+                n_int_with_val += 1
+    print(f"[DEBUG] ints total={n_int}, with_value={n_int_with_val}")
+
     # solve 前做一次度检查
     check_degree_balance(model)
 
@@ -1015,11 +1055,36 @@ def main():
 
     # 显式 warm start
     if ok_ws:
+        solver._warm_start()  
+        grb = solver._solver_model
+        print("[DEBUG] NumStart(after _warm_start) =", getattr(grb, "NumStart", -1))
         try:
-            solver.set_warm_start()
-        except Exception:
-            pass
-    
+            grb.write(str(OUT_DIR / "warmstart_debug.mst"))
+            print("[DEBUG] wrote warmstart_debug.mst")
+        except Exception as e:
+            print("[WARN] write mst failed:", e)
+
+    # ===== 兜底：若还是没有 MIP start，则手动把整型变量写入 Start =====
+    if getattr(grb, "NumStart", 0) == 0:
+        set_cnt = 0
+        for v in model.component_data_objects(Var, descend_into=True):
+            if not (v.is_binary() or v.is_integer()):
+                continue
+            if v.value is None:
+                continue
+            gv = grb.getVarByName(v.name)
+            if gv is None:
+                continue
+            gv.Start = float(round(v.value))
+            set_cnt += 1
+        grb.update()
+        print(f"[DEBUG] manual Starts set={set_cnt}, NumStart now={getattr(grb, 'NumStart', -1)}")
+        try:
+            grb.write(str(OUT_DIR / 'warmstart_debug.mst'))
+            print("[DEBUG] wrote warmstart_debug.mst (manual)")
+        except Exception as e:
+            print("[WARN] write mst failed (manual):", e)
+
     # Phase-1：找可行解优先（180s）
     solver.set_gurobi_param("TimeLimit",  180)
     solver.set_gurobi_param("MIPFocus",   1)
@@ -1027,10 +1092,12 @@ def main():
     solver.set_gurobi_param("PumpPasses", 50)
     solver.set_gurobi_param("RINS",       10)
     res1 = solver.solve(tee=True)
+    solver.load_vars()  # 把 incumbent 写回 Pyomo 变量
+    print("[INFO] Phase-1 incumbent Cmax =", pyo.value(model.Cmax))
 
     # Phase-2：若已有解则推界（420s + Cutoff），否则继续找解
     result_for_meta = res1
-    if has_incumbent(res1):
+    if has_incumbent(res1, model):
         UB_curr = float(value(model.Cmax))
         solver.set_gurobi_param("Cutoff", UB_curr - 1e-6)
         solver.set_gurobi_param("TimeLimit", 420)
