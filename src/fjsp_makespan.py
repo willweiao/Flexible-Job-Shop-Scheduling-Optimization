@@ -21,6 +21,8 @@ from pyomo.environ import (
     Objective, Constraint, minimize, SolverFactory, value
 )
 
+
+#class FJSPSolver:
 # ===== 读取 routing.csv 并构建基础数据 =====
 def load_routing(routing_csv: Path):
     """
@@ -939,7 +941,7 @@ def export_metadata(model, result, out_dir="outputs/mk01", solver_name="gurobi",
 
 # ===== 9) 主程序：把以上步骤串起来 =====
 def main():
-    case_name = "mk05"  # 根据所运行的案例进行修改
+    case_name = "mk07"  # 根据所运行的案例进行修改
     OUT_DIR = Path(f"outputs/{case_name}")
     LOGS_DIR = Path("logs")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
