@@ -26,6 +26,21 @@ plt.rcParams["figure.dpi"] = 150
 plt.rcParams["savefig.dpi"] = 150
 plt.rcParams["font.size"] = 10
 
+class Plotter:
+    def __init__(self, case_name: str):
+        self.case_name = case_name
+
+    def plot_all(self):
+
+        df = load_schedule(self.case_name)
+        out_dir = Path("outputs") / self.case_name / "figs"
+
+        plot_gantt(df, self.case_name, out_dir / f"gantt_{self.case_name}.png")
+        plot_util(df, self.case_name, out_dir / f"util_{self.case_name}.png")
+        plot_job_completion(df, self.case_name, out_dir / f"job_completion_{self.case_name}.png")
+        plot_wip(df, self.case_name, out_dir / f"wip_{self.case_name}.png")
+        print(f"[OK] Saved figures to: {out_dir.resolve()}")
+
 # ---------- Data ----------
 def load_schedule(case: str) -> pd.DataFrame:
     csv_path = Path("outputs") / case / "schedule_gantt.csv"

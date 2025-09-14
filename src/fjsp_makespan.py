@@ -22,7 +22,228 @@ from pyomo.environ import (
 )
 
 
-#class FJSPSolver:
+class FJSPSolver:
+    def __init__(self, case_name: str):
+        self.case_name = case_name
+        self.out_dir = Path(f"outputs/{case_name}")
+        self.logs_dir = Path("logs")
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.warm_dir = self.out_dir / "warmstart_lp"
+        self.warm_dir.mkdir(parents=True, exist_ok=True)
+    
+    def solve(self):
+        # 1) 读取数据
+        routing_csv = Path(f"data/processed/brandimarte/{self.case_name}/routing.csv")
+        assert routing_csv.exists(), f"routing.csv not found: {routing_csv}"
+        ops, eligible, proc_time, pred, machines, jk2i = load_routing(routing_csv)
+
+        # 2) 基础界：ES / 下界 / 安全上界
+        pmin, ES, H = bounds_for_bigM(ops, eligible, proc_time)
+        
+        # 下界：作业最短链 + assignment 下界
+        # 为了更有效地推下界，考虑基于 routing.csv 的数据计算每个作业的最短加工时间之和并取最大，作为全局 Cmax 的下界
+        # ops: list of (op_id, job, ord), eligible: {op_id: [machines]}, proc_time: {(op_id, m): p}
+        # 按作业分组
+        job_ops = {}
+        for iop, j, k in ops:
+            job_ops.setdefault(j, []).append(iop)
+        op_min_p = {op: min(proc_time[(op, m)] for m in eligible[op]) for oplist in job_ops.values() for op in oplist}
+        LB_job = max(sum(op_min_p[op] for op in oplist) for oplist in job_ops.values())
+        LB_assign = compute_assignment_LB(ops, eligible, proc_time, machines)
+        Cmax_lb_init = max(LB_job, int(ceil(LB_assign)))
+
+        # 安全上界（绝不会剪掉真解）
+        UB_safe = int(ceil(sum(min(proc_time[(op, m)] for m in eligible[op]) for (op, _, _) in ops)))
+
+        # 3) 构建相邻弧结构 + 模型（用 UB_safe 来算 Big-M）
+        I_ops = [i for (i,_,_) in ops]
+        Vi, arcs_all, arcs_opop, in_keys, incoming, out_keys, outgoing, Mbig, Ui = \
+            build_adj_structures(I=I_ops, M=machines, eligible=eligible, ES=ES, H=H)
+        
+        # 结构一致性自检（非常重要）
+        assert sanity_check(Vi, arcs_all, incoming, outgoing), "Arc/degree structure inconsistent."
+
+        model = build_model_adj(
+            ops, eligible, proc_time, pred, machines, ES, UB_safe,
+            Vi, arcs_all, arcs_opop, in_keys, incoming, out_keys, outgoing, Mbig, Ui
+        )
+
+        # 设上下界（紧化但安全）
+        model.Cmax.setlb(Cmax_lb_init)
+        model.Cmax.setub(UB_safe)
+        for op in model.I:
+            model.S[op].setub(UB_safe)
+            model.C[op].setub(UB_safe)
+
+        # 4) 先解一个 LP 松弛，提取 S*/x*，再用 SSGS 构造严格可行起点
+        okLP, relaxed, resLP, Sstar, xstar, obj_lp = solve_lp_relaxation_and_extract(model, ops, eligible, self.out_dir, self.case_name, timelimit=30, threads=16)
+        if not okLP:
+            print("[LP] 松弛求解未成功（见 logs 以及 Sstar_xstar_lp.csv），后续暖启动可能无效。")
+        else:
+            print("LP求解OK")
+
+        # 用 LP 引导的 SSGS 生成可行解；若 LP 解无效则会退化为基于 eligible/p 的 SSGS
+        UB_ws, x0, S0, C0 = lp_round_to_feasible(
+            ops, eligible, proc_time, pred, machines,
+            Sstar=Sstar, xstar=xstar
+        )
+        ok_sched, sched_info = summarize_schedule_ok(ops, eligible, proc_time, pred, x0, S0, C0)
+        if not ok_sched:
+            print("[HINT] LP→SSGS 仍不满足基本可行性，请先修这里（通常是 pred 或 eligible/p 的不一致）。")
+        else:
+            print()
+
+        ok_ws = check_warm_feasibility(ops, eligible, proc_time, pred, machines, x0, S0, C0)
+        # print(f"[DEBUG] ok_ws={ok_ws}")
+        if ok_ws:
+            UB_guess = max(Cmax_lb_init, int(math.ceil(UB_ws)))
+            apply_warm_start(model, x0, S0, C0, UB=UB_guess)
+            export_gantt(model, ops, eligible, out_dir=self.warm_dir)
+            export_assignment_long(model, ops, eligible, out_dir=self.warm_dir)
+            export_assignment_wide(model, ops, eligible, out_dir=self.warm_dir)
+            print("[WARM-EXPORT] LP→SSGS 的排程 CSV 已输出到：", self.warm_dir.resolve())
+            try:
+                warm_start_adj(model, ops, eligible, proc_time)  # 若模型有 y/u
+            except Exception as e:
+                print("[WARN] warm_start_adj failed:", e)
+        else:
+            print("[INFO] LP-guided warm start invalid. Proceeding WITHOUT any warm start.")
+        
+        # === 调试：统计有值的整数变量 ===
+        n_int = n_int_with_val = 0
+        for v in model.component_data_objects(Var, descend_into=True):
+            if v.is_binary() or v.is_integer():
+                n_int += 1
+                if v.value is not None:
+                    n_int_with_val += 1
+        print(f"[DEBUG] ints total={n_int}, with_value={n_int_with_val}")
+
+        # solve 前做一次度检查
+        check_degree_balance(model)
+
+        # 5) 导出 LP / MPS 到指定目录
+        model.write(str(self.out_dir / "model.mps"), format="mps")
+
+        # 6）gurobi_persistent 两阶段求解
+        solver = SolverFactory("gurobi_persistent")
+        solver.set_instance(model)   # 把当前变量及其起点送入 Gurobi 内存
+
+        # 日志与解文件
+        solver.set_gurobi_param("LogFile", str(self.logs_dir / f"{self.case_name}_gurobi.log"))
+        solver.set_gurobi_param("ResultFile", str(self.out_dir / "solution.sol"))
+        
+        solver.set_gurobi_param("Presolve",   2)
+        solver.set_gurobi_param("Cuts",       2)
+        solver.set_gurobi_param("Symmetry",   2)
+        solver.set_gurobi_param("Threads",    16)
+        solver.set_gurobi_param("NodefileStart", 0.5)
+
+        # 显式 warm start
+        if ok_ws:
+            solver._warm_start()  
+            grb = solver._solver_model
+            print("[DEBUG] NumStart(after _warm_start) =", getattr(grb, "NumStart", -1))
+            try:
+                grb.write(str(self.out_dir / "warmstart_debug.mst"))
+                print("[DEBUG] wrote warmstart_debug.mst")
+            except Exception as e:
+                print("[WARN] write mst failed:", e)
+
+        # ===== 兜底：若还是没有 MIP start，则手动把整型变量写入 Start =====
+        if getattr(grb, "NumStart", 0) == 0:
+            set_cnt = 0
+            for v in model.component_data_objects(Var, descend_into=True):
+                if not (v.is_binary() or v.is_integer()):
+                    continue
+                if v.value is None:
+                    continue
+                gv = grb.getVarByName(v.name)
+                if gv is None:
+                    continue
+                gv.Start = float(round(v.value))
+                set_cnt += 1
+            grb.update()
+            print(f"[DEBUG] manual Starts set={set_cnt}, NumStart now={getattr(grb, 'NumStart', -1)}")
+            try:
+                grb.write(str(self.out_dir / 'warmstart_debug.mst'))
+                print("[DEBUG] wrote warmstart_debug.mst (manual)")
+            except Exception as e:
+                print("[WARN] write mst failed (manual):", e)
+
+        # Phase-1：找可行解优先（180s）
+        solver.set_gurobi_param("TimeLimit",  180)
+        solver.set_gurobi_param("MIPFocus",   1)
+        solver.set_gurobi_param("Heuristics", 0.8)
+        solver.set_gurobi_param("PumpPasses", 50)
+        solver.set_gurobi_param("RINS",       10)
+        res1 = solver.solve(tee=True)
+        solver.load_vars()  # 把 incumbent 写回 Pyomo 变量
+        print("[INFO] Phase-1 incumbent Cmax =", pyo.value(model.Cmax))
+
+        # Phase-2：若已有解则推界（420s + Cutoff），否则继续找解
+        result_for_meta = res1
+        if has_incumbent(res1, model):
+            UB_curr = float(value(model.Cmax))
+            solver.set_gurobi_param("Cutoff", UB_curr - 1e-6)
+            solver.set_gurobi_param("TimeLimit", 420)
+            solver.set_gurobi_param("MIPFocus",  3)
+            solver.set_gurobi_param("Heuristics", 0.05)
+            res2 = solver.solve(tee=True)
+            result_for_meta = res2
+        else:
+            print("[WARN] No incumbent after phase-1. Staying in feasibility mode for another 420s.")
+            solver.set_gurobi_param("TimeLimit", 420)
+            solver.set_gurobi_param("MIPFocus",  1)
+            solver.set_gurobi_param("Heuristics", 0.9)
+            res2 = solver.solve(tee=True)
+            result_for_meta = res2
+        
+        # 7) 导出数据以及可视化
+        cmax_val = value(model.Cmax)
+        print("Cmax =", cmax_val)
+        
+        # 只有有解时才导出甘特/赋值，避免误导
+        if cmax_val is not None:
+            export_gantt(model, ops, eligible, out_dir=self.out_dir)
+            export_assignment_long(model, ops, eligible, out_dir=self.out_dir)
+            export_assignment_wide(model, ops, eligible, out_dir=self.out_dir)
+        else:
+            print("[WARN] No feasible solution found. Skipping schedule exports.")
+
+        # 把本轮真实参数写进 meta（便于回溯）
+        solver_opts_dump = {
+            "phase1": {
+                "TimeLimit": 180, "MIPFocus": 1, "Heuristics": 0.8,
+                "PumpPasses": 50, "RINS": 10, "Presolve": 2, "Cuts": 2, "Symmetry": 2,
+                "Threads": 16, "NodefileStart": 0.5,
+            },
+            "phase2": {
+                "TimeLimit": 420,
+                "MIPFocus": 3 if has_incumbent(res1) else 1,
+                "Heuristics": 0.05 if has_incumbent(res1) else 0.9,
+                "Cutoff": (float(cmax_val) - 1e-6) if (cmax_val is not None and has_incumbent(res1)) else None
+            }
+        }
+        export_metadata(
+            model, result_for_meta,
+            out_dir=self.out_dir,
+            solver_name="gurobi_persistent",
+            solver_options=solver_opts_dump,
+            extra={
+                "lp":  str((self.out_dir/"model.lp").resolve()),
+                "mps": str((self.out_dir/"model.mps").resolve()),
+                "sol": str((self.out_dir/"solution.sol").resolve()),
+                "log": str((self.logs_dir/f"{self.case_name}_gurobi.log").resolve()),
+                "lb_job": int(LB_job),
+                "lb_assign": int(ceil(LB_assign)),
+                "lb_init": int(Cmax_lb_init),
+                "ub_safe": int(UB_safe),
+                "warm_start_from_lp": bool(ok_ws),
+            }
+        )
+        print("输出已导出到：", self.out_dir.resolve(), self.logs_dir.resolve())
+
 # ===== 读取 routing.csv 并构建基础数据 =====
 def load_routing(routing_csv: Path):
     """
